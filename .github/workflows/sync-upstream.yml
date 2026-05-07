@@ -1,0 +1,64 @@
+name: Sync upstream NousResearch/hermes-agent
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # 04:00 UTC daily
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/NousResearch/hermes-agent.git
+
+      - name: Fetch upstream main
+        run: git fetch upstream main --tags
+
+      - name: Check if main is behind upstream
+        id: check
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "behind=false" >> $GITHUB_OUTPUT
+            echo "Main is already up to date with upstream."
+          else
+            echo "behind=true" >> $GITHUB_OUTPUT
+            echo "Upstream is ahead — will sync main then rebase homelab."
+          fi
+
+      - name: Reset main to upstream
+        if: steps.check.outputs.behind == 'true'
+        run: |
+          git reset --hard upstream/main
+          git push origin main --force-with-lease
+
+      - name: Fetch homelab branch
+        if: steps.check.outputs.behind == 'true'
+        run: git fetch origin homelab
+
+      - name: Rebase homelab on updated main
+        if: steps.check.outputs.behind == 'true'
+        run: |
+          git checkout -b homelab origin/homelab
+          git rebase origin/main
+          git push origin homelab --force-with-lease
+
+      # If rebase fails (patch conflict), this step is skipped and the job
+      # fails with an error — resolve manually: git checkout homelab &&
+      # git rebase origin/main → fix conflicts → git push --force-with-lease
