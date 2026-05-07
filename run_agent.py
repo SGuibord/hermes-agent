@@ -13129,6 +13129,32 @@ class AIAgent:
                     else:
                         assistant_message.content = str(raw)
 
+                # Strip JSON-wrapped text: generic models (non Hermes-trained) output
+                # {"role": "assistant", "content": "..."} or {"text": "..."} as literal
+                # text when given complex tool-use system prompts. Model-agnostic:
+                # no-op for models returning plain text (startswith check is False).
+                if (
+                    isinstance(assistant_message.content, str)
+                    and not getattr(assistant_message, "tool_calls", None)
+                ):
+                    _c = assistant_message.content.strip()
+                    if _c.startswith("{") and _c.endswith("}"):
+                        try:
+                            _parsed = __import__("json").loads(_c)
+                            if isinstance(_parsed, dict):
+                                _text = (
+                                    _parsed.get("content") or
+                                    _parsed.get("text") or
+                                    _parsed.get("message") or
+                                    _parsed.get("response") or
+                                    _parsed.get("answer")
+                                )
+                                if isinstance(_text, str) and _text:
+                                    assistant_message.content = _text
+                                    logger.debug("Stripped JSON-wrapped response from model output")
+                        except (ValueError, TypeError):
+                            pass
+
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
                     _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
