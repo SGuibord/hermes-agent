@@ -13130,9 +13130,13 @@ class AIAgent:
                         assistant_message.content = str(raw)
 
                 # Strip JSON-wrapped text: generic models (non Hermes-trained) output
-                # {"role": "assistant", "content": "..."} or {"text": "..."} as literal
-                # text when given complex tool-use system prompts. Model-agnostic:
-                # no-op for models returning plain text (startswith check is False).
+                # literal JSON instead of plain text when given agent system prompts.
+                # Handles two families of wrapping format:
+                #   • Legacy keys: {"content":"..."}, {"text":"..."}, etc.
+                #   • ReAct/action-input (gemma4, Llama-Instruct, Mistral…):
+                #       text  → {"action":"text",    "action_input":"message string"}
+                #       tools → {"action":"tool_name","action_input":{...}} (suppressed)
+                # Model-agnostic: no-op when content doesn't start with '{'.
                 if (
                     isinstance(assistant_message.content, str)
                     and not getattr(assistant_message, "tool_calls", None)
@@ -13149,6 +13153,18 @@ class AIAgent:
                                     _parsed.get("response") or
                                     _parsed.get("answer")
                                 )
+                                # ReAct / action-input format
+                                if not _text and "action" in _parsed and "action_input" in _parsed:
+                                    _action_input = _parsed["action_input"]
+                                    if isinstance(_action_input, str) and _action_input:
+                                        _text = _action_input
+                                    elif isinstance(_action_input, (dict, list)):
+                                        # Undispatched tool call — suppress raw JSON from Discord
+                                        logger.debug(
+                                            "Suppressed undispatched tool call JSON: action=%s",
+                                            _parsed["action"],
+                                        )
+                                        assistant_message.content = ""
                                 if isinstance(_text, str) and _text:
                                     assistant_message.content = _text
                                     logger.debug("Stripped JSON-wrapped response from model output")
