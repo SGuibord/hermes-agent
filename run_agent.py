@@ -13135,7 +13135,7 @@ class AIAgent:
                 #   • Legacy keys: {"content":"..."}, {"text":"..."}, etc.
                 #   • ReAct/action-input (gemma4, Llama-Instruct, Mistral…):
                 #       text  → {"action":"text",    "action_input":"message string"}
-                #       tools → {"action":"tool_name","action_input":{...}} (left as-is)
+                #       tools → {"action":"tool_name","action_input":{...}} → converted to tool_calls
                 # Model-agnostic: no-op when content doesn't start with '{'.
                 if (
                     isinstance(assistant_message.content, str)
@@ -13155,11 +13155,32 @@ class AIAgent:
                                 )
                                 # ReAct / action-input format
                                 if not _text and "action" in _parsed and "action_input" in _parsed:
+                                    _action = _parsed["action"]
                                     _action_input = _parsed["action_input"]
                                     if isinstance(_action_input, str) and _action_input:
+                                        # String input → plain text response
                                         _text = _action_input
-                                    # dict/list action_input = tool call: leave content unchanged
-                                    # so hermes can process it rather than seeing an empty response
+                                    elif isinstance(_action_input, (dict, list)) and _action:
+                                        # Dict/list input → real tool call; convert to tool_calls
+                                        # so Hermes dispatches it instead of showing JSON to user.
+                                        # SimpleNamespace and uuid are already imported at module top.
+                                        _tc_args = json.dumps(
+                                            _action_input if isinstance(_action_input, dict)
+                                            else {"args": _action_input}
+                                        )
+                                        assistant_message.tool_calls = [SimpleNamespace(
+                                            id=f"call_{uuid.uuid4().hex[:8]}",
+                                            type="function",
+                                            function=SimpleNamespace(
+                                                name=_action,
+                                                arguments=_tc_args,
+                                            ),
+                                        )]
+                                        assistant_message.content = None
+                                        logger.debug(
+                                            "Converted ReAct tool call to tool_calls: action=%s",
+                                            _action,
+                                        )
                                 if isinstance(_text, str) and _text:
                                     assistant_message.content = _text
                                     logger.debug("Stripped JSON-wrapped response from model output")
