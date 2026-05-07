@@ -127,7 +127,22 @@ def _has_valid_session_token(request: Request) -> bool:
 
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    if hmac.compare_digest(auth.encode(), expected.encode()):
+        return True
+
+    # Static API key for programmatic access (hermes-workspace, CI, etc.).
+    # Reuses HERMES_API_SERVER_KEY — already set in the vm104 environment,
+    # same value as the api_server platform key. No new secret required.
+    static_key = __import__("os").environ.get("HERMES_API_SERVER_KEY", "")
+    if static_key and auth.lower().startswith("bearer "):
+        bearer_token = auth[7:].strip()
+        if bearer_token and hmac.compare_digest(
+            bearer_token.encode(),
+            static_key.encode(),
+        ):
+            return True
+
+    return False
 
 
 def _require_token(request: Request) -> None:
@@ -850,6 +865,36 @@ async def get_config():
     config = _normalize_config_for_web(load_config())
     # Strip internal keys that the frontend shouldn't see or send back
     return {k: v for k, v in config.items() if not k.startswith("_")}
+
+
+@app.get("/api/mcp")
+async def get_mcp_servers(request: Request):
+    _require_token(request)
+    try:
+        config = load_config()
+        mcp_section = config.get("mcp", {}) if isinstance(config, dict) else {}
+        raw_servers = mcp_section.get("servers", [])
+        servers = []
+        for srv in raw_servers:
+            if not isinstance(srv, dict):
+                continue
+            name = srv.get("name") or srv.get("id")
+            url = srv.get("url")
+            if not name or not url:
+                continue
+            servers.append({
+                "name": name,
+                "id": name,
+                "url": url,
+                "transportType": srv.get("transport", "http"),
+                "description": srv.get("description", ""),
+                "enabled": srv.get("enabled", True),
+                "authType": "none",
+            })
+        return {"servers": servers}
+    except Exception:
+        _log.exception("GET /api/mcp failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/api/config/defaults")
