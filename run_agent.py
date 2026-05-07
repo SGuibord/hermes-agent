@@ -13129,14 +13129,10 @@ class AIAgent:
                     else:
                         assistant_message.content = str(raw)
 
-                # Strip JSON-wrapped text: generic models (non Hermes-trained) output
-                # literal JSON instead of plain text when given agent system prompts.
-                # Handles two families of wrapping format:
-                #   • Legacy keys: {"content":"..."}, {"text":"..."}, etc.
-                #   • ReAct/action-input (gemma4, Llama-Instruct, Mistral…):
-                #       text  → {"action":"text",    "action_input":"message string"}
-                #       tools → {"action":"tool_name","action_input":{...}} → converted to tool_calls
-                # Model-agnostic: no-op when content doesn't start with '{'.
+                # Strip JSON-wrapped text: some models output plain text wrapped in JSON
+                # ({"content":"..."}, {"text":"..."}, {"action":"text","action_input":"..."}).
+                # This is display-only — never dispatches tool calls.
+                # Only applies when the model returned no real tool_calls.
                 if (
                     isinstance(assistant_message.content, str)
                     and not getattr(assistant_message, "tool_calls", None)
@@ -13153,66 +13149,13 @@ class AIAgent:
                                     _parsed.get("response") or
                                     _parsed.get("answer")
                                 )
-                                # ReAct / action-input format
-                                if not _text and "action" in _parsed and "action_input" in _parsed:
-                                    _action = _parsed["action"]
-                                    _action_input = _parsed["action_input"]
-                                    if isinstance(_action_input, str) and _action_input:
-                                        if _action.lower() in ("text", "final answer", "final_answer"):
-                                            # Explicit text action → plain text response
-                                            _text = _action_input
-                                        else:
-                                            # Simplified ReAct: string arg for a named tool
-                                            # e.g. {"action":"read_file","action_input":"soul.md"}
-                                            # Wrap as {"path": arg} — works for all path-based tools.
-                                            _tc_args = json.dumps({"path": _action_input})
-                                            assistant_message.tool_calls = [SimpleNamespace(
-                                                id=f"call_{uuid.uuid4().hex[:8]}",
-                                                type="function",
-                                                function=SimpleNamespace(
-                                                    name=_action,
-                                                    arguments=_tc_args,
-                                                ),
-                                            )]
-                                            assistant_message.content = None
-                                            logger.debug(
-                                                "Converted ReAct string tool call to tool_calls: action=%s",
-                                                _action,
-                                            )
-                                    elif isinstance(_action_input, (dict, list)) and _action:
-                                        # Dict/list input → real tool call; convert to tool_calls
-                                        # so Hermes dispatches it instead of showing JSON to user.
-                                        # SimpleNamespace and uuid are already imported at module top.
-                                        _tc_args = json.dumps(
-                                            _action_input if isinstance(_action_input, dict)
-                                            else {"args": _action_input}
-                                        )
-                                        assistant_message.tool_calls = [SimpleNamespace(
-                                            id=f"call_{uuid.uuid4().hex[:8]}",
-                                            type="function",
-                                            function=SimpleNamespace(
-                                                name=_action,
-                                                arguments=_tc_args,
-                                            ),
-                                        )]
-                                        assistant_message.content = None
-                                        logger.debug(
-                                            "Converted ReAct tool call to tool_calls: action=%s",
-                                            _action,
-                                        )
-                                # Broad fallback: single-string-value dict with no tool-call keys.
-                                # Handles {"prompt":"..."}, {"query":"..."} and similar bare wrapping.
-                                # Only fires when no other extraction succeeded and content isn't
-                                # already a dispatched tool call.
-                                if (
-                                    not _text
-                                    and not getattr(assistant_message, "tool_calls", None)
-                                    and "action" not in _parsed
-                                    and "action_input" not in _parsed
+                                # ReAct text-only action ({"action":"text","action_input":"msg"})
+                                if not _text and _parsed.get("action", "").lower() in (
+                                    "text", "final answer", "final_answer"
                                 ):
-                                    _str_vals = [v for v in _parsed.values() if isinstance(v, str) and v.strip()]
-                                    if len(_str_vals) == 1:
-                                        _text = _str_vals[0]
+                                    _ai = _parsed.get("action_input", "")
+                                    if isinstance(_ai, str):
+                                        _text = _ai
                                 if isinstance(_text, str) and _text:
                                     assistant_message.content = _text
                                     logger.debug("Stripped JSON-wrapped response from model output")
