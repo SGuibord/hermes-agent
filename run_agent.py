@@ -13158,13 +13158,8 @@ class AIAgent:
                                     _action_input = _parsed["action_input"]
                                     if isinstance(_action_input, str) and _action_input:
                                         _text = _action_input
-                                    elif isinstance(_action_input, (dict, list)):
-                                        # Undispatched tool call — suppress raw JSON from Discord
-                                        logger.debug(
-                                            "Suppressed undispatched tool call JSON: action=%s",
-                                            _parsed["action"],
-                                        )
-                                        assistant_message.content = ""
+                                    # dict/list action_input = tool call: leave content unchanged
+                                    # so hermes can process it rather than seeing an empty response
                                 if isinstance(_text, str) and _text:
                                     assistant_message.content = _text
                                     logger.debug("Stripped JSON-wrapped response from model output")
