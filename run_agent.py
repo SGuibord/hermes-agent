@@ -13135,7 +13135,7 @@ class AIAgent:
                 #   • Legacy keys: {"content":"..."}, {"text":"..."}, etc.
                 #   • ReAct/action-input (gemma4, Llama-Instruct, Mistral…):
                 #       text  → {"action":"text",    "action_input":"message string"}
-                #       tools → {"action":"tool_name","action_input":{...}} (suppressed)
+                #       tools → {"action":"tool_name","action_input":{...}} (left as-is)
                 # Model-agnostic: no-op when content doesn't start with '{'.
                 if (
                     isinstance(assistant_message.content, str)
