@@ -23,6 +23,7 @@ import re
 import secrets
 import struct
 import tempfile
+import textwrap
 import time
 import uuid
 from datetime import datetime
@@ -31,6 +32,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
+
+WEIXIN_COPY_LINE_WIDTH = 120
 
 try:
     import aiohttp
@@ -602,7 +605,7 @@ def _assert_weixin_cdn_url(url: str) -> None:
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"Unparseable media URL: {url!r}") from exc
 
-    if scheme not in ("http", "https"):
+    if scheme not in {"http", "https"}:
         raise ValueError(
             f"Media URL has disallowed scheme {scheme!r}; only http/https are permitted."
         )
@@ -729,6 +732,46 @@ def _normalize_markdown_blocks(content: str) -> str:
         result.append(line)
 
     return "\n".join(result).strip()
+
+
+def _wrap_copy_friendly_lines_for_weixin(content: str) -> str:
+    """Wrap long display lines that are hard to copy in WeChat clients."""
+    if not content:
+        return content
+
+    wrapped: List[str] = []
+    in_code_block = False
+
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        if _FENCE_RE.match(stripped):
+            in_code_block = not in_code_block
+            wrapped.append(line)
+            continue
+
+        if (
+            in_code_block
+            or len(line) <= WEIXIN_COPY_LINE_WIDTH
+            or not stripped
+            or stripped.startswith("|")
+            or _TABLE_RULE_RE.match(stripped)
+        ):
+            wrapped.append(line)
+            continue
+
+        wrapped_lines = textwrap.wrap(
+            line,
+            width=WEIXIN_COPY_LINE_WIDTH,
+            break_long_words=False,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+            drop_whitespace=True,
+        )
+        wrapped.extend(wrapped_lines or [line])
+
+    return "\n".join(wrapped).strip()
 
 
 def _split_markdown_blocks(content: str) -> List[str]:
@@ -940,7 +983,7 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
             ref = item.get("ref_msg") or {}
             ref_item = ref.get("message_item") or {}
             ref_type = ref_item.get("type")
-            if ref_type in (ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE):
+            if ref_type in {ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE}:
                 title = ref.get("title") or ""
                 prefix = f"[引用媒体: {title}]\n" if title else "[引用媒体]\n"
                 return f"{prefix}{text}".strip()
@@ -1288,7 +1331,7 @@ class WeixinAdapter(BasePlatformAdapter):
 
                 ret = response.get("ret", 0)
                 errcode = response.get("errcode", 0)
-                if ret not in (0, None) or errcode not in (0, None):
+                if ret not in {0, None} or errcode not in {0, None}:
                     if (ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE
                             or _is_stale_session_ret(ret, errcode, response.get("errmsg"))):
                         logger.error("[%s] Session expired; pausing for 10 minutes", self.name)
@@ -1558,7 +1601,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 if resp and isinstance(resp, dict):
                     ret = resp.get("ret")
                     errcode = resp.get("errcode")
-                    if (ret is not None and ret not in (0,)) or (errcode is not None and errcode not in (0,)):
+                    if (ret is not None and ret not in {0,}) or (errcode is not None and errcode not in {0,}):
                         is_session_expired = (
                             ret == SESSION_EXPIRED_ERRCODE
                             or errcode == SESSION_EXPIRED_ERRCODE
@@ -2022,7 +2065,7 @@ class WeixinAdapter(BasePlatformAdapter):
     def format_message(self, content: Optional[str]) -> str:
         if content is None:
             return ""
-        return _normalize_markdown_blocks(content)
+        return _wrap_copy_friendly_lines_for_weixin(_normalize_markdown_blocks(content))
 
 
 async def send_weixin_direct(

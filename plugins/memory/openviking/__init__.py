@@ -100,14 +100,23 @@ class _VikingClient:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
 
     def _headers(self) -> dict:
+        # Always send tenant headers when account/user are configured.
+        # OpenViking 0.3.x requires X-OpenViking-Account and X-OpenViking-User
+        # for ROOT API key requests to tenant-scoped APIs — omitting them
+        # causes INVALID_ARGUMENT errors even when account="default".
+        # User-level keys can omit them (server derives tenancy from the key),
+        # but ROOT keys must always include them explicitly.
         h = {
             "Content-Type": "application/json",
-            "X-OpenViking-Account": self._account,
-            "X-OpenViking-User": self._user,
             "X-OpenViking-Agent": self._agent,
         }
+        if self._account:
+            h["X-OpenViking-Account"] = self._account
+        if self._user:
+            h["X-OpenViking-User"] = self._user
         if self._api_key:
             h["X-API-Key"] = self._api_key
+            h["Authorization"] = "Bearer " + self._api_key
         return h
 
     def _url(self, path: str) -> str:
@@ -179,7 +188,7 @@ class _VikingClient:
     def health(self) -> bool:
         try:
             resp = self._httpx.get(
-                self._url("/health"), timeout=3.0
+                self._url("/health"), headers=self._headers(), timeout=3.0
             )
             return resp.status_code == 200
         except Exception:

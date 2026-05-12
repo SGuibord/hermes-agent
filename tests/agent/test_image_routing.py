@@ -109,6 +109,21 @@ class TestDecideImageInputMode:
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):
             assert decide_image_input_mode("anthropic", "claude-sonnet-4", cfg) == "native"
 
+    def test_auto_uses_text_for_text_only_modalities_even_with_attachment_flag(self):
+        registry = {
+            "xiaomi": {
+                "models": {
+                    "mimo-v2.5-pro": {
+                        "attachment": True,
+                        "modalities": {"input": ["text"]},
+                        "tool_call": True,
+                    },
+                },
+            },
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            assert decide_image_input_mode("xiaomi", "mimo-v2.5-pro", {}) == "text"
+
 
 # ─── build_native_content_parts ──────────────────────────────────────────────
 
@@ -202,18 +217,33 @@ class TestBuildNativeContentParts:
         assert str(img2) in text_part["text"]
 
     def test_mime_inference_jpg(self, tmp_path: Path):
+        # Real JPEG bytes (SOI marker FF D8 FF): sniffing now wins over suffix.
         img = tmp_path / "photo.jpg"
-        img.write_bytes(_png_bytes())  # bytes are PNG but extension is jpg
+        img.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + b"\x00" * 32)
         parts, _ = build_native_content_parts("x", [str(img)])
         url = parts[1]["image_url"]["url"]
         assert url.startswith("data:image/jpeg;base64,")
 
     def test_mime_inference_webp(self, tmp_path: Path):
+        # Real WEBP bytes (RIFF....WEBP): sniffing now wins over suffix.
         img = tmp_path / "pic.webp"
-        img.write_bytes(_png_bytes())
+        img.write_bytes(b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 32)
         parts, _ = build_native_content_parts("", [str(img)])
         url = parts[1]["image_url"]["url"]
         assert url.startswith("data:image/webp;base64,")
+
+    def test_mime_sniff_overrides_misleading_extension(self, tmp_path: Path):
+        """Discord-style bug: file is named .webp but contains PNG bytes.
+        Anthropic rejects on MIME mismatch (HTTP 400) so we MUST sniff.
+        Regression guard for the user-reported Discord PNG-as-WEBP failure.
+        """
+        img = tmp_path / "discord_cached.webp"
+        img.write_bytes(_png_bytes())  # bytes are PNG, suffix lies
+        parts, _ = build_native_content_parts("", [str(img)])
+        url = parts[1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,"), (
+            f"Expected MIME sniffing to detect PNG bytes regardless of .webp suffix, got: {url[:60]}"
+        )
 
 
 # ─── Oversize handling ───────────────────────────────────────────────────────

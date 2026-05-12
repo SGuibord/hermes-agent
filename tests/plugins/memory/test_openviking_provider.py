@@ -299,3 +299,86 @@ def test_viking_client_raises_structured_server_error():
 
     with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
         client._parse_response(response)
+
+
+def test_viking_client_headers_include_bearer_when_api_key_set():
+    client = _VikingClient(
+        "https://example.com",
+        api_key="test-key",
+        account="acct",
+        user="usr",
+        agent="hermes",
+    )
+    headers = client._headers()
+    assert headers["X-API-Key"] == "test-key"
+    assert headers["Authorization"] == "Bearer test-key"
+
+
+def test_viking_client_headers_send_tenant_when_default():
+    # account/user set to the literal string "default". OpenViking 0.3.x
+    # requires X-OpenViking-Account and X-OpenViking-User for ROOT API key
+    # requests to tenant-scoped APIs — omitting them causes
+    # INVALID_ARGUMENT errors even when account="default".
+    client = _VikingClient(
+        "https://example.com",
+        api_key="test-key",
+        account="default",
+        user="default",
+        agent="hermes",
+    )
+    headers = client._headers()
+    assert headers["X-OpenViking-Account"] == "default"
+    assert headers["X-OpenViking-User"] == "default"
+    assert headers["X-OpenViking-Agent"] == "hermes"
+    assert headers["Authorization"] == "Bearer test-key"
+
+
+def test_viking_client_headers_send_tenant_when_empty_falls_back_to_default():
+    # Empty account/user strings fall back to "default" via the constructor.
+    # Headers are sent even for the default value — ROOT API keys need them.
+    client = _VikingClient(
+        "https://example.com",
+        api_key="",
+        account="",
+        user="",
+        agent="hermes",
+    )
+    headers = client._headers()
+    assert headers["X-OpenViking-Account"] == "default"
+    assert headers["X-OpenViking-User"] == "default"
+    assert "Authorization" not in headers
+    assert "X-API-Key" not in headers
+
+
+def test_viking_client_headers_sent_with_real_tenant_values():
+    client = _VikingClient(
+        "https://example.com",
+        api_key="test-key",
+        account="real-account",
+        user="real-user",
+        agent="hermes",
+    )
+    headers = client._headers()
+    assert headers["X-OpenViking-Account"] == "real-account"
+    assert headers["X-OpenViking-User"] == "real-user"
+
+
+def test_viking_client_health_sends_auth_headers(monkeypatch):
+    client = _VikingClient(
+        "https://example.com",
+        api_key="test-key",
+        account="",
+        user="",
+        agent="hermes",
+    )
+    captured = {}
+
+    def capture_get(url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs.get("headers") or {}
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(client._httpx, "get", capture_get)
+    assert client.health() is True
+    assert captured["url"] == "https://example.com/health"
+    assert captured["headers"]["Authorization"] == "Bearer test-key"
