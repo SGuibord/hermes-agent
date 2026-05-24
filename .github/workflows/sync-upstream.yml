@@ -39,7 +39,7 @@ jobs:
             echo "Main is already up to date with upstream."
           else
             echo "behind=true" >> $GITHUB_OUTPUT
-            echo "Upstream is ahead — will sync main then rebase homelab."
+            echo "Upstream is ahead — will sync main then merge homelab."
           fi
 
       - name: Reset main to upstream
@@ -52,13 +52,12 @@ jobs:
         if: steps.check.outputs.behind == 'true'
         run: git fetch origin homelab
 
-      - name: Rebase homelab on updated main
+      - name: Merge updated main into homelab (-X ours keeps our patches on conflicts)
         if: steps.check.outputs.behind == 'true'
         run: |
           git checkout -b homelab origin/homelab
-          git rebase origin/main
+          git merge origin/main --no-ff -X ours -m "chore(sync): merge upstream NousResearch/main into homelab"
           git push origin homelab --force-with-lease
 
-      # If rebase fails (patch conflict), this step is skipped and the job
-      # fails with an error — resolve manually: git checkout homelab &&
-      # git rebase origin/main → fix conflicts → git push --force-with-lease
+      # -X ours: on conflict, our homelab patches take precedence over upstream changes.
+      # Use 'git log --merges homelab' to track what upstream versions are merged in.
