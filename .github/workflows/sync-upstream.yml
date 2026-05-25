@@ -26,7 +26,7 @@ jobs:
       - name: Add upstream remote
         run: git remote add upstream https://github.com/NousResearch/hermes-agent.git
 
-      - name: Fetch upstream main
+      - name: Fetch upstream main and tags
         run: git fetch upstream main --tags
 
       - name: Check if main is behind upstream
@@ -39,14 +39,16 @@ jobs:
             echo "Main is already up to date with upstream."
           else
             echo "behind=true" >> $GITHUB_OUTPUT
-            echo "Upstream is ahead — will sync main then merge homelab."
+            echo "Upstream is ahead — will sync main, push tags, then merge homelab."
           fi
 
-      - name: Reset main to upstream
+      - name: Reset main to upstream and push tags
         if: steps.check.outputs.behind == 'true'
         run: |
           git reset --hard upstream/main
           git push origin main --force-with-lease
+          git push origin --tags --force
+          echo "Tags pushed: $(git tag | tail -3 | tr '\n' ', ')"
 
       - name: Fetch homelab branch
         if: steps.check.outputs.behind == 'true'
@@ -60,4 +62,4 @@ jobs:
           git push origin homelab --force-with-lease
 
       # -X ours: on conflict, our homelab patches take precedence over upstream changes.
-      # Use 'git log --merges homelab' to track what upstream versions are merged in.
+      # Tags are pushed so homelab-os check-hermes-upstream.yml can compare correctly.
