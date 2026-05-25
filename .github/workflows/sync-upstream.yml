@@ -59,7 +59,13 @@ jobs:
         run: |
           git checkout -b homelab origin/homelab
           git merge origin/main --no-ff -X ours -m "chore(sync): merge upstream NousResearch/main into homelab"
+          # Always take upstream version files — -X ours would keep stale version numbers otherwise.
+          # These files carry only the package version; our patches live in web_server.py and run_agent.py.
+          git checkout origin/main -- pyproject.toml hermes_cli/__init__.py
+          git commit --amend --no-edit
           git push origin homelab --force-with-lease
 
       # -X ours: on conflict, our homelab patches take precedence over upstream changes.
+      # Exception: pyproject.toml + hermes_cli/__init__.py always taken from upstream
+      #   so the dashboard always shows the correct version number.
       # Tags are pushed so homelab-os check-hermes-upstream.yml can compare correctly.
