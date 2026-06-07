@@ -43,13 +43,19 @@ jobs:
       - name: Merge upstream tag into homelab
         run: |
           git merge "refs/tags/${{ steps.tag.outputs.tag }}" -X ours --no-edit --allow-unrelated-histories
-          # Remove workflow files that upstream added (GITHUB_TOKEN lacks workflows scope)
-          # -X ours only handles conflicts; new upstream files are added without conflict
-          NEW_WF=$(git diff --name-only --diff-filter=A HEAD~1..HEAD -- .github/workflows/ 2>/dev/null || true)
-          if [ -n "$NEW_WF" ]; then
-            echo "Removing upstream-only workflow files: $NEW_WF"
-            echo "$NEW_WF" | xargs git rm -f
-            git commit -m "chore: remove upstream workflow files from homelab branch"
+          # Fix: GITHUB_TOKEN lacks 'workflow' OAuth scope, so any workflow file create/update
+          # in the push is rejected. Restore all .github/workflows/ changes to our homelab state.
+          WF_CHANGED=$(git diff --name-only HEAD~1..HEAD -- .github/workflows/ 2>/dev/null || true)
+          if [ -n "$WF_CHANGED" ]; then
+            echo "Fixing workflow files changed by merge: $WF_CHANGED"
+            while IFS= read -r f; do
+              if git show "HEAD~1:$f" > /dev/null 2>&1; then
+                git checkout "HEAD~1" -- "$f"
+              else
+                git rm -f "$f"
+              fi
+            done <<< "$WF_CHANGED"
+            git commit -m "chore: restore homelab workflow files after upstream merge"
           fi
 
       - name: Push to homelab
