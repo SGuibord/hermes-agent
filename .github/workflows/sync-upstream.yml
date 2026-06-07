@@ -1,71 +1,47 @@
-name: Sync upstream NousResearch/hermes-agent
+name: Sync homelab branch from upstream
 
 on:
-  schedule:
-    - cron: '0 4 * * *'  # 04:00 UTC daily
   workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Tag upstream (ex: v2026.6.5). Vide = latest.'
+        required: false
+        default: ''
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: homelab
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Add upstream remote
         run: git remote add upstream https://github.com/NousResearch/hermes-agent.git
 
-      - name: Fetch upstream main and tags
-        run: git fetch upstream main --tags
+      - name: Fetch upstream tags
+        run: git fetch upstream --tags
 
-      - name: Check if main is behind upstream
-        id: check
+      - name: Determine target tag
+        id: tag
         run: |
-          LOCAL=$(git rev-parse HEAD)
-          UPSTREAM=$(git rev-parse upstream/main)
-          if [ "$LOCAL" = "$UPSTREAM" ]; then
-            echo "behind=false" >> $GITHUB_OUTPUT
-            echo "Main is already up to date with upstream."
+          if [ -n "${{ inputs.upstream_tag }}" ]; then
+            echo "tag=${{ inputs.upstream_tag }}" >> $GITHUB_OUTPUT
           else
-            echo "behind=true" >> $GITHUB_OUTPUT
-            echo "Upstream is ahead — will sync main, push tags, then merge homelab."
+            TAG=$(git tag -l --sort=-version:refname | head -1)
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
           fi
 
-      - name: Reset main to upstream and push tags
-        if: steps.check.outputs.behind == 'true'
-        run: |
-          git reset --hard upstream/main
-          git push origin main --force-with-lease
-          git push origin --tags --force
-          echo "Tags pushed: $(git tag | tail -3 | tr '\n' ', ')"
+      - name: Merge upstream tag
+        run: git merge "refs/tags/${{ steps.tag.outputs.tag }}" -X ours --no-edit --allow-unrelated-histories
 
-      - name: Fetch homelab branch
-        if: steps.check.outputs.behind == 'true'
-        run: git fetch origin homelab
-
-      - name: Merge updated main into homelab (-X ours keeps our patches on conflicts)
-        if: steps.check.outputs.behind == 'true'
-        run: |
-          git checkout -b homelab origin/homelab
-          git merge origin/main --no-ff -X ours -m "chore(sync): merge upstream NousResearch/main into homelab"
-          # Always take upstream version files — -X ours would keep stale version numbers otherwise.
-          # These files carry only the package version; our patches live in web_server.py and run_agent.py.
-          git checkout origin/main -- pyproject.toml hermes_cli/__init__.py
-          git commit --amend --no-edit
-          git push origin homelab --force-with-lease
-
-      # -X ours: on conflict, our homelab patches take precedence over upstream changes.
-      # Exception: pyproject.toml + hermes_cli/__init__.py always taken from upstream
-      #   so the dashboard always shows the correct version number.
-      # Tags are pushed so homelab-os check-hermes-upstream.yml can compare correctly.
+      - name: Push to homelab
+        run: git push origin homelab
