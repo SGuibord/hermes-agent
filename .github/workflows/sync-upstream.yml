@@ -42,13 +42,15 @@ jobs:
 
       - name: Merge upstream tag into homelab
         run: |
-          BEFORE=$(git rev-parse HEAD)
           git merge "refs/tags/${{ steps.tag.outputs.tag }}" -X ours --no-edit --allow-unrelated-histories
-          # Restore our .github/workflows/ to avoid pushing upstream workflow files
-          # (new upstream workflow files added by merge are not conflicts so -X ours doesn't block them)
-          git checkout "$BEFORE" -- .github/workflows/ 2>/dev/null || true
-          git diff --cached --quiet .github/workflows/ || \
-            git commit -m "chore: restore homelab workflow files after upstream merge"
+          # Remove workflow files that upstream added (GITHUB_TOKEN lacks workflows scope)
+          # -X ours only handles conflicts; new upstream files are added without conflict
+          NEW_WF=$(git diff --name-only --diff-filter=A HEAD~1..HEAD -- .github/workflows/ 2>/dev/null || true)
+          if [ -n "$NEW_WF" ]; then
+            echo "Removing upstream-only workflow files: $NEW_WF"
+            echo "$NEW_WF" | xargs git rm -f
+            git commit -m "chore: remove upstream workflow files from homelab branch"
+          fi
 
       - name: Push to homelab
         run: git push origin homelab
