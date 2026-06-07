@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      workflows: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,8 +40,15 @@ jobs:
             echo "tag=$TAG" >> $GITHUB_OUTPUT
           fi
 
-      - name: Merge upstream tag
-        run: git merge "refs/tags/${{ steps.tag.outputs.tag }}" -X ours --no-edit --allow-unrelated-histories
+      - name: Merge upstream tag into homelab
+        run: |
+          BEFORE=$(git rev-parse HEAD)
+          git merge "refs/tags/${{ steps.tag.outputs.tag }}" -X ours --no-edit --allow-unrelated-histories
+          # Restore our .github/workflows/ to avoid pushing upstream workflow files
+          # (new upstream workflow files added by merge are not conflicts so -X ours doesn't block them)
+          git checkout "$BEFORE" -- .github/workflows/ 2>/dev/null || true
+          git diff --cached --quiet .github/workflows/ || \
+            git commit -m "chore: restore homelab workflow files after upstream merge"
 
       - name: Push to homelab
         run: git push origin homelab
