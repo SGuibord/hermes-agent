@@ -1,0 +1,62 @@
+name: Sync main branch from upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Tag upstream (ex: v2026.6.5). Vide = latest.'
+        required: false
+        default: ''
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/NousResearch/hermes-agent.git
+
+      - name: Fetch upstream tags
+        run: git fetch upstream --tags
+
+      - name: Determine target tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.upstream_tag }}" ]; then
+            echo "tag=${{ inputs.upstream_tag }}" >> $GITHUB_OUTPUT
+          else
+            TAG=$(git tag -l --sort=-version:refname | head -1)
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge upstream tag into main
+        run: |
+          git merge "refs/tags/${{ steps.tag.outputs.tag }}" -X ours --no-edit --allow-unrelated-histories
+          # Fix: GITHUB_TOKEN lacks 'workflow' OAuth scope, so any workflow file create/update
+          # in the push is rejected. Restore all .github/workflows/ changes to our state.
+          WF_CHANGED=$(git diff --name-only HEAD~1..HEAD -- .github/workflows/ 2>/dev/null || true)
+          if [ -n "$WF_CHANGED" ]; then
+            echo "Fixing workflow files changed by merge: $WF_CHANGED"
+            while IFS= read -r f; do
+              if git show "HEAD~1:$f" > /dev/null 2>&1; then
+                git checkout "HEAD~1" -- "$f"
+              else
+                git rm -f "$f"
+              fi
+            done <<< "$WF_CHANGED"
+            git commit -m "chore: restore workflow files after upstream merge"
+          fi
+
+      - name: Push updated main
+        run: git push origin main
