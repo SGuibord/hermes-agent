@@ -15,11 +15,11 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
-from contextlib import contextmanager
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -44,6 +44,59 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
+    """Return a compact one-line failure message for chat delivery.
+
+    Full details stay in the cron output directory and the logs. Chat should
+    show the operator what broke without dumping provider JSON, retry noise, or
+    stack traces into the delivery channel.
+    """
+    job_name = job.get("name") or job.get("id") or "cron job"
+    text = (error or "unknown error").strip()
+    lower = text.lower()
+
+    # Provider/API failures are the common noisy path. Keep these short.
+    if "429" in text or "rate limit" in lower or "usage limit" in lower:
+        reason = "rate limit"
+        if "weekly usage limit" in lower:
+            reason = "weekly usage limit"
+        elif "quota" in lower:
+            reason = "quota limit"
+        return (
+            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
+            "Fallback chain was exhausted or unavailable. "
+            "Full details saved in cron output."
+        )
+
+    if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
+        return (
+            f"⚠️ Cron '{job_name}' failed: provider timeout. "
+            "Fallback chain was exhausted or unavailable. "
+            "Full details saved in cron output."
+        )
+
+    # Match authentication/authorization wording at a word boundary and the
+    # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
+    # not trip a misleading auth message.
+    if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
+        return (
+            f"⚠️ Cron '{job_name}' failed: provider authentication error. "
+            "Full details saved in cron output."
+        )
+
+    # Strip common exception wrappers and collapse provider payloads. Bound
+    # the input first so a multi-KB provider blob cannot slow the
+    # substitutions.
+    cleaned = re.sub(
+        r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
+        "", text[:2000],
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > 180:
+        cleaned = cleaned[:177].rstrip() + "..."
+    return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -139,6 +192,7 @@ _HOME_TARGET_ENV_VARS = {
     "bluebubbles": "BLUEBUBBLES_HOME_CHANNEL",
     "qqbot": "QQBOT_HOME_CHANNEL",
     "whatsapp": "WHATSAPP_HOME_CHANNEL",
+    "whatsapp_cloud": "WHATSAPP_CLOUD_HOME_CHANNEL",
 }
 
 # Legacy env var names kept for back-compat.  Each entry is the current
@@ -166,7 +220,7 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
-# Sequential (env/context-mutating) cron jobs — workdir/profile jobs that touch
+# Sequential (env-mutating) cron jobs — workdir jobs that touch
 # process-global runtime state — must run one at a time, but must NOT block the
 # ticker thread.  A persistent single-thread executor preserves ordering across
 # ticks while keeping dispatch fire-and-forget, the same as the parallel pool.
@@ -190,10 +244,10 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
 def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent single-thread sequential pool.
 
-    A single worker guarantees env/context-mutating jobs never overlap, even
+    A single worker guarantees env-mutating jobs never overlap, even
     across ticks: a job queued by a newer tick waits for the previous tick's
-    sequential jobs to finish rather than corrupting their os.environ /
-    profile state.
+    sequential jobs to finish rather than corrupting their os.environ
+    state.
     """
     global _sequential_pool
     if _sequential_pool is None:
@@ -233,71 +287,6 @@ def _get_lock_paths() -> tuple[Path, Path]:
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
     return lock_dir, lock_dir / ".tick.lock"
-
-
-@contextmanager
-def _job_profile_context(job_id: str, profile: Optional[str]):
-    """Temporarily run a job under a specific Hermes profile.
-
-    Cron jobs are stored and scheduled by the profile running the scheduler, but
-    an individual job can opt into a different runtime profile. While active,
-    the scheduler's test/override hook and a context-local Hermes home override
-    both point at the resolved profile directory so _get_hermes_home(),
-    .env/config loading, script resolution, AIAgent construction, and downstream
-    get_hermes_home() callers agree on the same home.
-
-    Some existing provider/config paths still load profile .env values through
-    os.environ, so profile jobs also snapshot and restore the process
-    environment on exit. tick() runs profile jobs sequentially to keep that
-    temporary mutation isolated from other scheduled jobs.
-    """
-    raw_profile = str(profile or "").strip()
-    if not raw_profile:
-        yield None
-        return
-
-    global _hermes_home
-    prior_override = _hermes_home
-    env_snapshot = os.environ.copy()
-
-    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-
-    normalized_profile = normalize_profile_name(raw_profile)
-    try:
-        profile_home = Path(resolve_profile_env(normalized_profile)).resolve()
-    except (FileNotFoundError, ValueError) as exc:
-        logger.warning(
-            "Job '%s': configured profile %r no longer valid (%s) — "
-            "falling back to scheduler default",
-            job_id, raw_profile, exc,
-        )
-        yield None
-        return
-
-    override_token = None
-    try:
-        override_token = set_hermes_home_override(profile_home)
-        _hermes_home = profile_home
-        logger.info(
-            "Job '%s': using Hermes profile '%s' (%s)",
-            job_id,
-            normalized_profile,
-            profile_home,
-        )
-        yield normalized_profile
-    finally:
-        _hermes_home = prior_override
-        if override_token is not None:
-            reset_hermes_home_override(override_token)
-        # Delta-based restore: remove added keys, restore changed keys.
-        # Avoids a brief window where other threads see an empty env.
-        added = set(os.environ.keys()) - set(env_snapshot.keys())
-        for k in added:
-            os.environ.pop(k, None)
-        for k, v in env_snapshot.items():
-            if os.environ.get(k) != v:
-                os.environ[k] = v
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -821,6 +810,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
+        target_errors = []
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
@@ -835,18 +825,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
                     if future is None:
                         adapter_ok = False
+                        target_errors.append("live adapter event loop scheduling failed")
                     else:
                         try:
                             send_result = future.result(timeout=60)
-                        except TimeoutError:
+                        except TimeoutError as te:
                             future.cancel()
+                            target_errors.append(f"live adapter send timed out: {te}")
                             raise
-                        if send_result and not getattr(send_result, "success", True):
-                            err = getattr(send_result, "error", "unknown")
+                        except Exception as ex:
+                            target_errors.append(f"live adapter send failed: {ex}")
+                            raise
+
+                        if send_result is None or not getattr(send_result, "success", True):
+                            err = getattr(send_result, "error", "unknown") if send_result else "no response from adapter"
+                            msg = f"live adapter send to {platform_name}:{chat_id} failed: {err}"
                             logger.warning(
-                                "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
-                                job["id"], platform_name, chat_id, err,
+                                "Job '%s': %s, falling back to standalone",
+                                job["id"], msg,
                             )
+                            target_errors.append(msg)
                             adapter_ok = False  # fall through to standalone path
                         elif (
                             send_result
@@ -878,9 +876,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
             except Exception as e:
+                err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
+                if not any(err_msg in err for err in target_errors):
+                    target_errors.append(err_msg)
                 logger.warning(
-                    "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
-                    job["id"], platform_name, chat_id, e,
+                    "Job '%s': %s, falling back to standalone",
+                    job["id"], err_msg,
                 )
 
         if not delivered:
@@ -900,13 +901,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
+                target_errors.extend([msg])
+                delivery_errors.extend(target_errors)
                 continue
 
             if result and result.get("error"):
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
+                target_errors.extend([msg])
+                delivery_errors.extend(target_errors)
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
@@ -972,6 +975,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
     (the `memory-watchdog.sh` pattern) without wrapping them in Python.
 
+    Subprocess environment is passed through ``_sanitize_subprocess_env`` so
+    provider credentials and other Hermes-managed secrets are not inherited
+    (SECURITY.md §2.3), matching terminal and MCP child processes.
+
     Args:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
@@ -1032,18 +1039,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     else:
         argv = [sys.executable, str(path)]
 
-    run_env = os.environ.copy()
-    run_env["HERMES_HOME"] = str(_get_hermes_home())
     try:
-        from hermes_constants import get_subprocess_home
+        from tools.environments.local import _sanitize_subprocess_env
 
-        profile_home = get_subprocess_home()
-        if profile_home:
-            run_env["HOME"] = profile_home
-    except Exception:
-        pass
-
-    try:
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
         result = subprocess.run(
             argv,
@@ -1051,7 +1049,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=run_env,
+            env=_sanitize_subprocess_env(os.environ.copy()),
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -1381,13 +1379,6 @@ def _scan_assembled_cron_prompt(
 
 
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
-    """Execute a single cron job, applying any per-job profile override."""
-    job_id = job["id"]
-    with _job_profile_context(job_id, job.get("profile")):
-        return _run_job_impl(job)
-
-
-def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
     
@@ -1624,9 +1615,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     #     .cursorrules from the job's project dir, AND
     #   - the terminal, file, and code-exec tools run commands from there.
     #
-    # tick() serializes jobs that mutate process-global runtime state (workdir
-    # and/or profile jobs) outside the parallel pool, so mutating
-    # os.environ["TERMINAL_CWD"] here is safe for those jobs. For workdir-less
+    # tick() serializes workdir-jobs outside the parallel pool, so mutating
+    # os.environ["TERMINAL_CWD"] here is safe for those jobs.  For workdir-less
     # jobs we leave TERMINAL_CWD untouched — preserves the original behaviour
     # (skip_context_files=True, tools use whatever cwd the scheduler has).
     _job_workdir = (job.get("workdir") or "").strip() or None
@@ -1672,6 +1662,15 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             if os.path.exists(_cfg_path):
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _cfg = yaml.safe_load(_f) or {}
+                # Managed scope: a scheduled job must honor administrator-pinned
+                # model / reasoning / toolsets / provider_routing too. This loader
+                # builds its own dict, so overlay managed values via the shared
+                # helper (fail-open, no-op when no managed scope).
+                try:
+                    from hermes_cli import managed_scope
+                    _cfg = managed_scope.apply_managed_overlay(_cfg)
+                except Exception:
+                    pass
                 _cfg = _expand_env_vars(_cfg)
                 _model_cfg = _cfg.get("model", {})
                 if not job.get("model"):
@@ -2052,6 +2051,82 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+    """Run ONE due job end-to-end: execute → save output → deliver → mark.
+
+    This is the shared firing body extracted from ``tick``'s per-job closure so
+    that BOTH the built-in ticker and an external provider's ``fire_due`` (e.g.
+    Chronos) run the identical sequence — no duplicated correctness.
+
+    It does NOT decide whether the job is due, claim it, or compute the next
+    run — those are the caller's concern (``tick`` advances ``next_run_at``
+    under the file lock before dispatch; an external provider claims via the
+    store CAS). This function only fires the given job once.
+
+    Returns True if the job was processed (even if the job itself failed —
+    failure is recorded via ``mark_job_run``), False only if processing raised.
+    """
+    try:
+        success, output, final_response, error = run_job(job)
+
+        output_file = save_job_output(job["id"], output)
+        if verbose:
+            logger.info("Output saved to: %s", output_file)
+
+        # Deliver the final response to the origin/target chat.
+        # If the agent responded with [SILENT], skip delivery (but
+        # output is already saved above).  Failed jobs always deliver.
+        deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+        # Treat whitespace-only final responses the same as empty
+        # responses: do not deliver a blank message, and let the
+        # empty-response guard below mark the run as a soft failure.
+        should_deliver = bool(deliver_content.strip())
+        if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+            logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+            should_deliver = False
+
+        delivery_error = None
+        if should_deliver:
+            try:
+                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+            except Exception as de:
+                delivery_error = str(de)
+                logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+        # Treat empty final_response as a soft failure so last_status
+        # is not "ok" — the agent ran but produced nothing useful.
+        # (issue #8585)
+        if success and not final_response.strip():
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        return True
+
+    except Exception as e:
+        logger.error("Error processing job %s: %s", job['id'], e)
+        mark_job_run(job["id"], False, str(e))
+        return False
+
+
+def _notify_provider_jobs_changed() -> None:
+    """Best-effort: tell the active scheduler provider the job set changed.
+
+    Called by the consumer surfaces (model tool / CLI / REST) AFTER a
+    successful store mutation (create/update/remove/pause/resume) so an external
+    provider (Chronos) can re-provision/cancel the affected one-shot via NAS.
+    No-op for the built-in (it re-reads jobs.json each tick), so the default
+    path is unchanged. Lives here (not in cron/jobs.py) to keep the store free
+    of provider imports — avoids an import cycle and keeps jobs.py low-coupling.
+    Never raises into the caller.
+    """
+    try:
+        from cron.scheduler_provider import resolve_cron_scheduler
+        resolve_cron_scheduler().on_jobs_changed()
+    except Exception as e:
+        logger.debug("on_jobs_changed notify failed: %s", e)
+
+
 def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
     """
     Check and run all due jobs.
@@ -2130,64 +2205,18 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             )
 
         def _process_job(job: dict) -> bool:
-            """Run one due job end-to-end: execute, save, deliver, mark."""
-            try:
-                success, output, final_response, error = run_job(job)
+            """Run one due job end-to-end. Thin wrapper around the shared
+            module-level ``run_one_job`` so ``tick`` and external providers
+            (Chronos ``fire_due``) use the identical execute→save→deliver→mark
+            body."""
+            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-                output_file = save_job_output(job["id"], output)
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
-
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                # Treat whitespace-only final responses the same as empty
-                # responses: do not deliver a blank message, and let the
-                # empty-response guard below mark the run as a soft failure.
-                should_deliver = bool(deliver_content.strip())
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
-
-                delivery_error = None
-                if should_deliver:
-                    try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                    except Exception as de:
-                        delivery_error = str(de)
-                        logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-                # Treat empty final_response as a soft failure so last_status
-                # is not "ok" — the agent ran but produced nothing useful.
-                # (issue #8585)
-                if success and not final_response.strip():
-                    success = False
-                    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-                return True
-
-            except Exception as e:
-                logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
-                return False
-
-        # Partition due jobs: jobs with a per-job workdir and/or profile touch
-        # process-global runtime state inside run_job. Workdir jobs temporarily
-        # set os.environ["TERMINAL_CWD"]; profile jobs use a context-local
-        # Hermes home override, scheduler _hermes_home hook, and temporary
-        # profile .env load into os.environ with snapshot/restore. They MUST run
-        # sequentially to avoid corrupting each other. Jobs without either field
-        # stay parallel-safe.
-        sequential_jobs = [
-            j for j in due_jobs
-            if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()
-        ]
-        parallel_jobs = [
-            j for j in due_jobs
-            if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())
-        ]
+        # Partition due jobs: those with a per-job workdir mutate
+        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —
+        # so they MUST run sequentially to avoid corrupting each other.  Jobs
+        # without a workdir leave env untouched and stay parallel-safe.
+        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
+        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
 
         _results: list = []
         _all_futures: list = []
@@ -2216,9 +2245,9 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
 
             return pool.submit(_run_and_release)
 
-        # Sequential pass for env/context-mutating (workdir/profile) jobs.
+        # Sequential pass for env-mutating (workdir) jobs.
         # Queued to a persistent single-thread pool so they run one at a time
-        # WITHOUT blocking the ticker thread — a long workdir/profile job no
+        # WITHOUT blocking the ticker thread — a long workdir job no
         # longer starves the rest of the schedule (same fix as the parallel
         # pass, just serialized).  The in-flight guard prevents a still-running
         # job from being re-queued on the next tick.
