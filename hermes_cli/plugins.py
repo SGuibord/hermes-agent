@@ -172,17 +172,19 @@ VALID_HOOKS: Set[str] = {
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
-    # command needs user approval -- fires BOTH for CLI-interactive prompts
-    # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
+    # command needs an approval decision -- fires for CLI-interactive prompts,
+    # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
     # Observers only: return values are ignored. Plugins cannot veto or
     # pre-answer an approval from these hooks (use pre_tool_call to block
     # a tool before it reaches approval).
     #
     # Kwargs for pre_approval_request:
     #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
-    #   session_key: str, surface: "cli" | "gateway"
+    #   session_key: str, surface: "cli" | "gateway" | "smart"
     # Kwargs for post_approval_response: same as above plus
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
+    #           | "smart_approve" | "smart_deny"
+    #   decided_by: "aux_llm"  -- only on surface="smart"
     "pre_approval_request",
     "post_approval_response",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
@@ -1599,7 +1601,7 @@ class PluginManager:
                 init_file = plugin_dir / "__init__.py"
                 if init_file.exists():
                     try:
-                        source_text = init_file.read_text(errors="replace")[:8192]
+                        source_text = init_file.read_text(errors="replace", encoding="utf-8")[:8192]
                         if (
                             "register_memory_provider" in source_text
                             or "MemoryProvider" in source_text
