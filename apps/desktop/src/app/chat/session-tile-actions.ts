@@ -29,6 +29,7 @@ import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
+import { setSessionDraftingTool } from '@/store/tool-drafting'
 import type { SessionInfo } from '@/types/hermes'
 
 import { uploadComposerAttachment } from '../session/hooks/use-prompt-actions'
@@ -40,7 +41,10 @@ import {
   planEdit,
   planReload,
   planRestore,
+  rebindSurvivorRowIds,
   runRewindSubmit,
+  survivorRowIdsFrom,
+  type SurvivorUserRowIds,
   truncateSubmitParams
 } from '../session/hooks/use-prompt-actions/rewind'
 import { useSubmitPrompt } from '../session/hooks/use-prompt-actions/submit'
@@ -156,19 +160,34 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       sessionId: string,
       attachments: ComposerAttachment[],
       options: { updateComposerAttachments?: boolean } = {}
-    ): Promise<ComposerAttachment[]> => {
+    ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
       const remote = $connection.get()?.mode === 'remote'
+      let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
 
+      // A tile owns its own runtime binding, so a recovery here rebinds the
+      // tile's ref rather than the foreground session's.
+      const onSessionRecovered = (recoveredId: string) => {
+        liveSessionId = recoveredId
+        runtimeIdRef.current = recoveredId
+      }
+
       for (const attachment of attachments) {
-        if (!attachment.path || attachment.attachedSessionId === sessionId) {
+        if (!attachment.path || attachment.attachedSessionId === liveSessionId) {
           synced.push(attachment)
 
           continue
         }
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
-          const next = await uploadComposerAttachment(attachment, { remote, requestGateway, sessionId })
+          const next = await uploadComposerAttachment(attachment, {
+            backendCwd: readState()?.cwd,
+            remote,
+            requestGateway,
+            sessionId: liveSessionId,
+            storedSessionId: storedIdRef.current,
+            onSessionRecovered
+          })
 
           if (options.updateComposerAttachments ?? true) {
             scope.attachments.update(next)
@@ -182,7 +201,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         synced.push(attachment)
       }
 
-      return synced
+      return { attachments: synced, sessionId: liveSessionId }
     },
     [requestGateway, scope.attachments]
   )
@@ -253,6 +272,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     clearSessionTodos(sessionId)
     clearSessionSubagents(sessionId)
     resetSessionBackground(sessionId)
+    setSessionDraftingTool(sessionId, '')
     clearAllPrompts(sessionId)
     clearClarifyRequest(undefined, sessionId)
 
@@ -349,9 +369,45 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
   // Rewind primitive (interrupt-first for live turns, busy-retry) — shared with
   // the primary chat so the two can't diverge.
   const submitRewind = useCallback(
-    (text: string, truncateOrdinal: number | undefined, interruptFirst: boolean) =>
-      runRewindSubmit(requestGateway, runtimeIdRef.current, text, truncateOrdinal, interruptFirst),
+    (
+      text: string,
+      truncateOrdinal: number | undefined,
+      interruptFirst: boolean,
+      truncateMessageId?: string,
+      truncateRowId?: number
+    ) =>
+      runRewindSubmit(
+        requestGateway,
+        runtimeIdRef.current,
+        text,
+        truncateOrdinal,
+        truncateMessageId,
+        interruptFirst,
+        {
+          storedSessionId: storedIdRef.current,
+          onSessionRecovered: recoveredId => {
+            runtimeIdRef.current = recoveredId
+          }
+        },
+        truncateRowId
+      ),
     [requestGateway]
+  )
+
+  // After a durable rewind the surviving bubbles' cached rowIds are stale (the
+  // gateway re-inserted the kept prefix as new SQLite rows). Rebind them to the
+  // authoritative post-rewrite ids so the NEXT rewind/edit/regenerate doesn't
+  // send a dead id and get refused with 4018 (consecutive-rewind staleness,
+  // #83202 review).
+  const applySurvivorRowIds = useCallback(
+    (survivorRowIds: SurvivorUserRowIds | undefined) => {
+      if (!survivorRowIds) {
+        return
+      }
+
+      update(state => ({ ...state, messages: rebindSurvivorRowIds(state.messages, survivorRowIds) }))
+    },
+    [update]
   )
 
   const reloadFromMessage = useCallback(
@@ -371,21 +427,23 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       update(current => applyReloadOptimistic(current, plan))
 
       try {
-        await requestGateway(
+        const result = await requestGateway<{ survivor_user_row_ids?: unknown }>(
           'prompt.submit',
           {
             session_id: runtimeIdRef.current,
             text: plan.text,
-            ...truncateSubmitParams(plan.truncateOrdinal)
+            ...truncateSubmitParams(plan.truncateOrdinal, plan.truncateMessageId, plan.truncateRowId)
           },
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
+
+        applySurvivorRowIds(survivorRowIdsFrom(result))
       } catch (err) {
         update(current => ({ ...current, busy: false, awaitingResponse: false }))
         notifyError(err, copy.regenerateFailed)
       }
     },
-    [copy.regenerateFailed, readState, requestGateway, update]
+    [applySurvivorRowIds, copy.regenerateFailed, readState, requestGateway, update]
   )
 
   const restoreToMessage = useCallback(
@@ -403,13 +461,15 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       update(state => applyRewindOptimistic(state, plan.sourceIndex))
 
       try {
-        await submitRewind(plan.text, plan.truncateOrdinal, wasBusy)
+        applySurvivorRowIds(
+          await submitRewind(plan.text, plan.truncateOrdinal, wasBusy, plan.truncateMessageId, plan.truncateRowId)
+        )
       } catch (err) {
         update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))
         throw err
       }
     },
-    [readMessages, readState, submitRewind, update]
+    [applySurvivorRowIds, readMessages, readState, submitRewind, update]
   )
 
   const editMessage = useCallback(
@@ -432,13 +492,15 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       update(state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
 
       try {
-        await submitRewind(plan.text, plan.truncateOrdinal, wasBusy)
+        applySurvivorRowIds(
+          await submitRewind(plan.text, plan.truncateOrdinal, wasBusy, plan.truncateMessageId, plan.truncateRowId)
+        )
       } catch (err) {
         update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))
         notifyError(err, copy.editFailed)
       }
     },
-    [copy.editFailed, readMessages, readState, submitRewind, update]
+    [applySurvivorRowIds, copy.editFailed, readMessages, readState, submitRewind, update]
   )
 
   // Branch-visibility sync (assistant-ui hides non-active branches).

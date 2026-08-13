@@ -297,14 +297,50 @@ describe('ClarifyTool keyboard navigation', () => {
   })
 })
 
+describe('ClarifyTool recommended option', () => {
+  it('dims the (Recommended) label and answers with the choice the backend sent', async () => {
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: ['staging (Recommended)', 'production'],
+      question: 'Which deployment target?',
+      requestId: 'request-1',
+      sessionId: 'session-1'
+    })
+    renderClarify(<ClarifyTool {...liveClarifyProps(['staging (Recommended)', 'production'])} />)
+
+    const recommended = screen.getByRole('button', { name: /staging/ })
+
+    // The label rides in its own muted span so the option text still reads first.
+    expect(recommended.querySelector('.text-\\(--ui-text-tertiary\\)')?.textContent).toBe('(Recommended)')
+
+    fireEvent.click(recommended)
+    fireEvent.keyDown(window, { key: 'Enter' })
+
+    // The decorated string goes back verbatim; the tool strips the label before
+    // the agent ever sees the answer.
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'staging (Recommended)',
+        request_id: 'request-1'
+      })
+    })
+  })
+})
+
 describe('ClarifyTool pending marker', () => {
-  it('marks a live choices card so type-to-focus yields its shortcut keys', () => {
+  it('marks a live choices card with its row count so type-to-focus yields exactly its keys', () => {
     renderLiveClarify()
 
-    // The marker is what `composerFocusBlockedBySurface` keys off of, so the
-    // global type-to-focus listener stands down and A/B/C… + 1-9 + Enter reach
-    // the card instead of the composer.
-    expect(document.querySelector('[data-clarify-choices]')).toBeTruthy()
+    // `clarifyCardOwnsKey` reads the count off this marker to yield only the
+    // shortcuts the card renders (A..N + "Other", 1-9, Enter) and let every
+    // other printable through to the composer.
+    const card = document.querySelector('[data-clarify-choices]')
+
+    expect(card).toBeTruthy()
+    expect(Number(card?.getAttribute('data-clarify-choices'))).toBeGreaterThan(0)
   })
 
   it('does not mark a free-text (no-choice) pending card', () => {

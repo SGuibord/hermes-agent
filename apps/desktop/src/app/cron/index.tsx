@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Codicon } from '@/components/ui/codicon'
 import {
   Dialog,
@@ -48,6 +49,7 @@ import { AlertTriangle } from '@/lib/icons'
 import { requestModelOptions } from '@/lib/model-options'
 import { asText } from '@/lib/text'
 import { $cronFocusJobId, $cronJobs, setCronFocusJobId, setCronJobs, updateCronJobs } from '@/store/cron'
+import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
 import { $profileScope, ALL_PROFILES } from '@/store/profile'
 
@@ -63,16 +65,22 @@ import {
   PanelHeader,
   PanelList,
   PanelListRow,
+  type PanelMenuItem,
   PanelMeta,
   PanelPill,
   type PanelPillTone,
-  PanelRowMenu,
   PanelSectionLabel
 } from '../overlays/panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import { BlueprintSlotControl, blueprintSlotHelp, cleanBlueprintFieldError, initialBlueprintValues } from './blueprints'
-import { cronEditorUpdates, jobIsScriptOnly, validateCronEditor } from './cron-job-model'
+import {
+  cronEditorUpdates,
+  jobIsScriptOnly,
+  parseCronDeliveryTargets,
+  toggleCronDeliveryTarget,
+  validateCronEditor
+} from './cron-job-model'
 import { jobState, jobTitle, STATE_DOT } from './job-state'
 
 const DEFAULT_DELIVER = 'local'
@@ -348,6 +356,21 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
     [jobs, query]
   )
 
+  // Blueprint recipes render in the same list rail, below the jobs — clicking
+  // one opens the create dialog pre-seeded to that recipe. Same query key as
+  // the dialog's "Start from" dropdown, so the catalog is fetched once.
+  const blueprintsQuery = useQuery({
+    queryKey: ['cron-blueprints'],
+    queryFn: async () => (await getAutomationBlueprints()).blueprints
+  })
+
+  const visibleBlueprints = useMemo(() => {
+    const list = blueprintsQuery.data ?? []
+    const needle = query.trim().toLowerCase()
+
+    return needle ? list.filter(item => `${item.title} ${item.description}`.toLowerCase().includes(needle)) : list
+  }, [blueprintsQuery.data, query])
+
   // Detail always reflects a concrete job: the explicitly selected one, else the
   // first visible row, so the right pane is never empty while jobs exist.
   const selectedJob = useMemo(
@@ -472,7 +495,7 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
 
       {loading && jobs.length === 0 ? (
         <PageLoader label={c.loading} />
-      ) : totalCount === 0 ? (
+      ) : totalCount === 0 && visibleBlueprints.length === 0 ? (
         <PanelEmpty
           action={
             <Button onClick={() => setEditor({ mode: 'create' })} size="sm">
@@ -501,14 +524,11 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
                 active={selectedJob?.id === job.id}
                 job={job}
                 key={job.id}
-                menu={
-                  <PanelRowMenu
-                    items={[
-                      { icon: 'edit', label: c.edit, onSelect: () => setEditor({ mode: 'edit', job }) },
-                      { icon: 'trash', label: t.common.delete, onSelect: () => setPendingDelete(job), tone: 'danger' }
-                    ]}
-                  />
-                }
+                menuItems={[
+                  { icon: 'edit', label: c.edit, onSelect: () => setEditor({ mode: 'edit', job }) },
+                  { icon: 'trash', label: t.common.delete, onSelect: () => setPendingDelete(job), tone: 'danger' }
+                ]}
+                menuLabel={c.manage}
                 onSelect={() => setSelectedJobId(job.id)}
               />
             ))}
@@ -516,6 +536,21 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
               <p className="px-2 py-4 text-center text-xs text-muted-foreground">{c.emptyTitleSearch}</p>
             )}
             <PanelAddButton label={c.newCron} onClick={() => setEditor({ mode: 'create' })} />
+            {visibleBlueprints.length > 0 && (
+              <>
+                <PanelSectionLabel className="mt-3 px-2">{c.blueprints.tab}</PanelSectionLabel>
+                {visibleBlueprints.map(item => (
+                  <PanelListRow
+                    active={false}
+                    icon="rocket"
+                    key={item.key}
+                    onSelect={() => setEditor({ blueprintKey: item.key, mode: 'create' })}
+                    rowKey={`blueprint-${item.key}`}
+                    title={item.title}
+                  />
+                ))}
+              </>
+            )}
           </PanelList>
 
           {selectedJob ? (
@@ -571,12 +606,14 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
 function CronJobListRow({
   active,
   job,
-  menu,
+  menuItems,
+  menuLabel,
   onSelect
 }: {
   active: boolean
   job: CronJob
-  menu?: React.ReactNode
+  menuItems?: PanelMenuItem[]
+  menuLabel?: string
   onSelect: () => void
 }) {
   const state = jobState(job)
@@ -585,7 +622,8 @@ function CronJobListRow({
     <PanelListRow
       active={active}
       dotClassName={STATE_DOT[state] ?? 'bg-muted-foreground'}
-      menu={menu}
+      menuItems={menuItems}
+      menuLabel={menuLabel}
       onSelect={onSelect}
       rowKey={job.id}
       title={jobTitle(job)}
@@ -672,10 +710,12 @@ function formatRunTime(seconds?: null | number): string {
   return Number.isNaN(date.valueOf()) ? '—' : date.toLocaleString()
 }
 
-// Runs are produced by the background scheduler tick (no UI signal), so poll
-// while the panel is open + on tab re-focus so a fired run shows up within a few
-// seconds instead of waiting for a reload.
+// Runs are produced by the background scheduler tick. cron.changed /
+// sessions.changed broadcasts re-load immediately on event-capable backends
+// (the tick dep below), so the poll drops to a slow backstop there; older
+// backends keep the legacy cadence.
 const RUNS_POLL_INTERVAL_MS = 8000
+const RUNS_BACKSTOP_INTERVAL_MS = 60_000
 
 function CronJobRuns({
   c,
@@ -687,6 +727,8 @@ function CronJobRuns({
   onOpenSession?: (sessionId: string) => void
 }) {
   const [runs, setRuns] = useState<null | SessionInfo[]>(null)
+  const changeEventsAvailable = useStore($changeEventsAvailable)
+  const cronChangeTick = useStore($cronChangeTick)
 
   useEffect(() => {
     let cancelled = false
@@ -706,11 +748,14 @@ function CronJobRuns({
 
     void load()
 
-    const intervalId = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        void load()
-      }
-    }, RUNS_POLL_INTERVAL_MS)
+    const intervalId = window.setInterval(
+      () => {
+        if (document.visibilityState === 'visible') {
+          void load()
+        }
+      },
+      changeEventsAvailable ? RUNS_BACKSTOP_INTERVAL_MS : RUNS_POLL_INTERVAL_MS
+    )
 
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
@@ -725,7 +770,8 @@ function CronJobRuns({
       window.clearInterval(intervalId)
       document.removeEventListener('visibilitychange', onVisible)
     }
-  }, [jobId])
+    // cronChangeTick: a fired run moves jobs.json bookkeeping → reload now.
+  }, [changeEventsAvailable, cronChangeTick, jobId])
 
   return (
     <div>
@@ -769,10 +815,11 @@ function deliverTargetLabel(target: CronDeliveryTarget, c: Translations['cron'])
   return target.id !== 'local' && !target.home_target_set ? `${base} — ${c.deliverNeedsHomeChannel}` : base
 }
 
-// The delivery-target dropdown, shared by the manual cron editor and the
-// blueprint form so both offer exactly the connected platforms (never a
-// hardcoded list). While the targets load, keep the current value selectable.
-function DeliverSelect({
+// The delivery-target checkbox group, shared by the manual cron editor and the
+// blueprint form. The scheduler accepts comma-separated targets, so users can
+// keep results local while also sending them to connected platforms. Preserve
+// selected targets missing from discovery so editing never drops a saved route.
+export function DeliverCheckboxes({
   c,
   id,
   onChange,
@@ -785,21 +832,39 @@ function DeliverSelect({
   targets: CronDeliveryTarget[]
   value: string
 }) {
-  const options = targets.length > 0 ? targets : [{ home_env_var: null, home_target_set: true, id: value, name: value }]
+  const selected = parseCronDeliveryTargets(value)
+  const knownIds = new Set(targets.map(target => target.id))
+
+  const options = [
+    ...targets,
+    ...selected
+      .filter(target => !knownIds.has(target))
+      .map(target => ({ home_env_var: null, home_target_set: true, id: target, name: target }))
+  ]
 
   return (
-    <Select onValueChange={onChange} value={value}>
-      <SelectTrigger className="h-9 rounded-md" id={id}>
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>
-        {options.map(target => (
-          <SelectItem key={target.id} value={target.id}>
-            {deliverTargetLabel(target, c)}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
+    <div
+      aria-labelledby={`${id}-label`}
+      className="grid gap-2 rounded-md border border-input px-3 py-2.5"
+      id={id}
+      role="group"
+    >
+      {options.map((target, index) => {
+        const checked = selected.includes(target.id)
+        const checkboxId = `${id}-${index}`
+
+        return (
+          <label className="flex items-center gap-2 text-sm" htmlFor={checkboxId} key={target.id}>
+            <Checkbox
+              checked={checked}
+              id={checkboxId}
+              onCheckedChange={next => onChange(toggleCronDeliveryTarget(value, target.id, next === true))}
+            />
+            <span>{deliverTargetLabel(target, c)}</span>
+          </label>
+        )
+      })}
+    </div>
   )
 }
 
@@ -884,10 +949,10 @@ function CronEditorDialog({
     setDeliver(initial ? jobDeliver(initial) : DEFAULT_DELIVER)
     setModelChoice(initial && jobModel(initial) ? `${jobProvider(initial)}:${jobModel(initial)}` : MODEL_DEFAULT_VALUE)
     setSlotValues({})
-    setTemplateChoice(CUSTOM_TEMPLATE)
+    setTemplateChoice(editor.mode === 'create' ? (editor.blueprintKey ?? CUSTOM_TEMPLATE) : CUSTOM_TEMPLATE)
     setError(null)
     setSaving(false)
-  }, [initial, open])
+  }, [editor, initial, open])
 
   // Seed the typed slots with the blueprint's defaults whenever a blueprint is
   // picked from "Start from" (and reset them when switching back to Custom).
@@ -1032,7 +1097,7 @@ function CronEditorDialog({
                     // Use the shared, backend-sourced delivery targets (same as the
                     // manual editor) rather than the blueprint's static field.options,
                     // so both dialogs offer exactly the connected platforms.
-                    <DeliverSelect
+                    <DeliverCheckboxes
                       c={c}
                       id={fieldId}
                       onChange={next => setSlotValues(prev => ({ ...prev, [field.name]: next }))}
@@ -1113,7 +1178,7 @@ function CronEditorDialog({
               </Field>
 
               <Field htmlFor="cron-deliver" label={c.deliverLabel}>
-                <DeliverSelect
+                <DeliverCheckboxes
                   c={c}
                   id="cron-deliver"
                   onChange={setDeliver}
@@ -1197,7 +1262,12 @@ function CronEditorDialog({
   )
 }
 
-type EditorState = { job: CronJob; mode: 'edit' } | { mode: 'closed' } | { mode: 'create' }
+type EditorState =
+  | { job: CronJob; mode: 'edit' }
+  | { mode: 'closed' }
+  // `blueprintKey` pre-selects a blueprint in the create dialog's "Start from"
+  // dropdown (set when a recipe row in the list rail is clicked).
+  | { blueprintKey?: string; mode: 'create' }
 
 interface EditorValues {
   deliver: string
