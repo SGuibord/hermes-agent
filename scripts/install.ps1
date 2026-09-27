@@ -4,6 +4,7 @@
 #   -Manifest             print the stage list as JSON
 #   -Stage NAME [-Json]   run one stage
 #   -NonInteractive       skip stages that need input
+#   -SkipSetup            deprecated alias for -NonInteractive
 #   -IncludeDesktop       add the desktop build stage
 #   -ProtocolVersion      print the stage protocol version
 #   -SkipBrowser          do not install the browser tools (agent-browser +
@@ -22,6 +23,9 @@ param(
     [string]$Stage,
     [switch]$ProtocolVersion,
     [switch]$NonInteractive,
+    # Pre-rework spelling of -NonInteractive, still accepted so install
+    # wrappers written against the old switch keep binding (#125350).
+    [switch]$SkipSetup,
     [switch]$Json,
     [switch]$IncludeDesktop,
     # Same opt-out as install.sh --skip-browser: PM records it, so later
@@ -37,6 +41,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# -SkipSetup is the pre-rework spelling of -NonInteractive.
+if ($SkipSetup) { $NonInteractive = $true }
 
 # --- Dot-source guard (part 1: detect) ---------------------------------------
 # Tests (and any embedding host) dot-source this file (`. install.ps1`) to get
